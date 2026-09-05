@@ -70,7 +70,7 @@ pub fn StructEncoderBuilder(
                     // For child structs, create and call its encoder within the a slice of out_buffer, starting at current position
                     // This is designed to pack all information optimally, in varints.
                     if (field.is_enum) {
-                        try writeULEB(out_buffer, &cursor, @intFromEnum(clean_value));
+                        try write(out_buffer, &cursor, @intFromEnum(clean_value));
                     } else if (field.shape != null) {
                         // create child struct
                         const ChildEncoder = StructEncoderBuilder(unwrapOptional(field.type));
@@ -80,7 +80,7 @@ pub fn StructEncoderBuilder(
                         // move to position written to
                         cursor += written.len;
                     } else {
-                        try writeULEB(out_buffer, &cursor, clean_value);
+                        try write(out_buffer, &cursor, clean_value);
                     }
                 }
             }
@@ -149,7 +149,7 @@ pub fn StructEncoderBuilder(
                         // For enums, get their tag type, and decode against their tag types (i.e. u4), and set the field
                         const T = unwrapOptional(field.type);
                         const tag_type = @typeInfo(T).@"enum".tag_type;
-                        const tag_value = try readULEB(tag_type, payload_bytes, &local_cursor);
+                        const tag_value = try read(tag_type, payload_bytes, &local_cursor);
                         @field(instance, field.name) = @as(T, @enumFromInt(tag_value));
                     } else if (field.shape != null) {
                         // For child structs, we need to get an encoder for their type, get the slice from current position onwards,
@@ -167,7 +167,7 @@ pub fn StructEncoderBuilder(
                     } else {
                         // For all others (uints), we just decode and set
                         const T = unwrapOptional(field.type);
-                        @field(instance, field.name) = try readULEB(T, payload_bytes, &local_cursor);
+                        @field(instance, field.name) = try read(T, payload_bytes, &local_cursor);
                     }
                 }
             }
@@ -178,6 +178,46 @@ pub fn StructEncoderBuilder(
             return instance;
         }
 
+        /// Intermidate writer, that either calls writeULEB on T with >7 bits,
+        /// or encodes the value as a u8 directly with a its leading 0.
+        ///
+        /// TODO: Change to a direct encoding strategy for u8s or smaller.
+        /// Currently, u8s larger than 127 use 2 bytes, and smaller ones use a full byte.
+        fn write(buffer: []u8, cursor: *usize, value: anytype) !void {
+            const T = @TypeOf(value);
+
+            if (@bitSizeOf(T) <= 7) {
+                const as: u8 = @as(u8, @intCast(value));
+
+                if (cursor.* >= buffer.len) return error.NoSpaceLeft;
+                buffer[cursor.*] = as;
+                cursor.* += 1;
+            } else {
+                return writeULEB(buffer, cursor, value);
+            }
+        }
+
+        /// Intermidate reader, that either calls readULEB on T with >7 bits,
+        /// or truncates it directly from its u8 form to T.
+        fn read(comptime T: type, buffer: []const u8, cursor: *usize) !T {
+            const TSize = @bitSizeOf(T);
+            if (@bitSizeOf(T) <= 7) {
+                if (cursor.* >= buffer.len) return error.EndOfStream;
+
+                const byte = buffer[cursor.*];
+                cursor.* += 1;
+
+                if (byte > std.math.pow(u8, TSize - 1, 2)) {
+                    return error.EncodedValueTooWide;
+                }
+
+                const chunk: T = @intCast(byte & 0b0111_1111); // 0x7F
+                return chunk;
+            } else {
+                return readULEB(T, buffer, cursor);
+            }
+        }
+
         /// Writes a uint of abitrary size, as a series of unsigned length encoded bytes (VarInt), to a buffer from cursor.
         ///
         /// Data (value) is chunked into 8 bits, where the 0th marks start (1) or continuation (0), and the
@@ -186,19 +226,11 @@ pub fn StructEncoderBuilder(
             var mut_value = value;
 
             while (true) {
-                var chunk: u8 = undefined;
+                var chunk = @as(u8, @intCast(mut_value & 0b0111_1111));
+                mut_value >>= 7;
 
-                // HACK: need to all for <=u8 literals, since we are losing size
-                if (@bitSizeOf(@TypeOf(mut_value)) < 8) {
-                    const mv: u8 = @intCast(mut_value);
-                    chunk = @as(u8, @intCast(mv & 0b0111_1111));
-                } else {
-                    chunk = @as(u8, @intCast(mut_value & 0b0111_1111));
-                    mut_value >>= 7;
-
-                    if (mut_value != 0) {
-                        chunk |= 0b1000_0000;
-                    }
+                if (mut_value != 0) {
+                    chunk |= 0b1000_0000;
                 }
 
                 if (cursor.* >= buffer.len) return error.NoSpaceLeft;

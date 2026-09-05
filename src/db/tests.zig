@@ -6,11 +6,22 @@ test {
     _ = headers;
 }
 
+fn enc_dec_test_printer(before: anytype, encoded: []const u8, after: anytype) void {
+    std.debug.print("pre: {any} \nencoded: ", .{before});
+
+    for (encoded) |byte| {
+        std.debug.print("{b:0>8} ", .{byte});
+    }
+
+    std.debug.print("\npost: {any}\n", .{after});
+}
+
 const SimpleStruct: type = struct {
     id: u32,
     length: u128,
     big: u256,
     small: u8,
+    tiny: u2,
 };
 
 test "header_encoder_encodes_and_decodes_simple" {
@@ -21,6 +32,7 @@ test "header_encoder_encodes_and_decodes_simple" {
         .length = 12345678910,
         .big = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff,
         .small = 255,
+        .tiny = 1,
     };
 
     var memory_pool: [@bitSizeOf(SimpleStruct) / 8]u8 = undefined;
@@ -31,7 +43,7 @@ test "header_encoder_encodes_and_decodes_simple" {
     try std.testing.expectEqual(@intFromPtr(&memory_pool[0]), @intFromPtr(&encoded_slice[0]));
 
     // assert size is expected from encoding
-    try std.testing.expectEqual(@as(usize, 46), encoded_slice.len);
+    try std.testing.expectEqual(@as(usize, 47), encoded_slice.len);
 
     const decoded_data = try Encoder.Decode(encoded_slice);
 
@@ -39,6 +51,9 @@ test "header_encoder_encodes_and_decodes_simple" {
     try std.testing.expectEqual(my_s.length, decoded_data.length);
     try std.testing.expectEqual(my_s.big, decoded_data.big);
     try std.testing.expectEqual(my_s.small, decoded_data.small);
+
+    std.debug.print("SIMPLE E-D TEST\n-----------\n", .{});
+    enc_dec_test_printer(my_s, encoded_slice, decoded_data);
 }
 
 const ComplexStruct = struct {
@@ -73,4 +88,7 @@ test "header_encoder_encodes_and_decodes_optional_recursive" {
     const decoded_data = try Encoder.Decode(encoded_slice);
 
     try std.testing.expectEqualDeep(my_s, decoded_data);
+
+    std.debug.print("RECURSIVE E-D TEST\n-----------\n", .{});
+    enc_dec_test_printer(my_s, encoded_slice, decoded_data);
 }
