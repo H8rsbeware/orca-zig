@@ -7,29 +7,45 @@ const henc = @import("header_encoder.zig");
 // alignment.dat - blob of what references what and where
 //
 
+test "Headers_all_assert_as_headers" {
+    assertIsHeaderType(FileHeader);
+    assertIsHeaderType(SequenceRecord);
+    assertIsHeaderType(Extent);
+}
+
+pub fn assertIsHeaderType(comptime T: type) void {
+    const has_encode = @hasDecl(T, "Encode");
+    const has_decode = @hasDecl(T, "Decode");
+
+    if (!has_encode or !has_decode) {
+        @compileError("Type '" ++ @typeName(T) ++
+            "' is missing Header methods. Must implement both " ++
+            "'pub fn Encode(self) []const u8' and 'pub fn Decode([]const u8) self'.");
+    }
+}
+
 const PageId = u32;
 const SequenceId = u32;
 
-const FileKind = enum(u3) {
+/// File type with top header of DB files
+pub const DBFileType = enum(u3) {
     META_DATA = 0b000,
     SEQUENCE_DATA = 0b001,
     ALIGNMENT_DATA = 0b010,
+    COLD_DATA = 0b011,
     // reserve rest
 };
 
-const SequenceEncoding = enum(u2) {
-    BIT_2,
-    BIT3_REFERENCED,
-    // reserve rest
-};
-
-const FileHeader = struct { // 83
+/// File header is written to the top of each db file,
+/// including version, kind (DBFileType), page_shift (where size == 1<<S),
+/// and generation (update count).
+pub const FileHeader = struct { // 83
     const Self = @This();
     const Engine = henc.StructEncoderBuilder(Self);
     const byteSize = (@bitSizeOf(Self) + 7) / 8;
 
     version: u8,
-    kind: FileKind,
+    kind: DBFileType,
     page_shift: u8,
     generation: u64,
 
@@ -43,7 +59,15 @@ const FileHeader = struct { // 83
     }
 };
 
-const SequenceRecord = struct { // max 226 bits
+/// Sequences encoding type within DB
+const SequenceEncoding = enum(u2) {
+    BIT_2,
+    BIT3_REFERENCED,
+    // reserve rest
+};
+
+/// Meta data for a sequence, determining what, where, and how long sequences are.
+pub const SequenceRecord = struct { // max 226 bits
     const Self = @This();
     const Engine = henc.StructEncoderBuilder(Self);
     const byteSize = (@bitSizeOf(Self) + 7) / 8;
@@ -64,6 +88,9 @@ const SequenceRecord = struct { // max 226 bits
     }
 };
 
+/// Records the start and end page of a given sequence and how much of the
+/// last page remains.
+/// sequence length == (page_length * (1 << page_shift)) - page_unused
 const Extent = struct { // 96
     const Self = @This();
     const Engine = henc.StructEncoderBuilder(Self);
@@ -82,12 +109,3 @@ const Extent = struct { // 96
         return try Engine.Decode(slice);
     }
 };
-
-test "FileHeader_encodes_and_decodes_same" {
-    var fh: FileHeader = .{ .version = 10, .kind = FileKind.SEQUENCE_DATA, .page_shift = 12, .generation = 3 };
-
-    const enc: []const u8 = try fh.Encode();
-    const dec: FileHeader = try FileHeader.Decode(enc);
-
-    try std.testing.expectEqualDeep(fh, dec);
-}

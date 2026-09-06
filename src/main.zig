@@ -1,19 +1,14 @@
 const std = @import("std");
+const db = @import("db/db.zig");
+const app_c = @import("config.zig");
+const config: app_c.DBConfig = @import("config.zon");
 
-const config = @import("config.zon");
-const DBConfig = @import("config.zig").DBConfig;
-
-const dbStartup = @import("db/startup.zig");
-
-const CONFIG: DBConfig = .{config.db_location};
-
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     std.debug.print("Hello, World!\n", .{});
 
-    const ok: bool = try dbStartup.EnsureDB(CONFIG);
-    if (!ok) {
-        return;
-    }
+    const io = init.io;
+    const database = try db.Database.init(io, config);
+    defer database.deinit(io);
 }
 
 test {

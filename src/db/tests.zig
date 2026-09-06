@@ -16,6 +16,19 @@ fn enc_dec_test_printer(before: anytype, encoded: []const u8, after: anytype) vo
     std.debug.print("\npost: {any}\n", .{after});
 }
 
+// -- Actual header type checks
+
+test "FileHeader_encodes_and_decodes_same" {
+    var fh: headers.FileHeader = .{ .version = 10, .kind = headers.DBFileType.SEQUENCE_DATA, .page_shift = 12, .generation = 3 };
+
+    const enc: []const u8 = try fh.Encode();
+    const dec: headers.FileHeader = try headers.FileHeader.Decode(enc);
+
+    try std.testing.expectEqualDeep(fh, dec);
+}
+
+// -- StructEncoderBuilder test
+
 const SimpleStruct: type = struct {
     id: u32,
     length: u128,
