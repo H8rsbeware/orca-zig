@@ -44,6 +44,7 @@ pub const DBFileType = enum(u3) {
 pub const FileHeader = struct { // 83
     const Self = @This();
     const Engine = henc.StructEncoderBuilder(Self);
+    pub const max_encoded_size = Engine.max_encoded_size;
 
     version: u8,
     kind: DBFileType,
@@ -51,7 +52,7 @@ pub const FileHeader = struct { // 83
     generation: u64,
 
     pub fn Encode(self: Self) ![]const u8 {
-        var buffer: [Engine.max_encoded_size]u8 = undefined;
+        var buffer: [max_encoded_size]u8 = undefined;
         return try Engine.Encode(self, &buffer);
     }
 
@@ -78,6 +79,7 @@ pub const SequenceState = enum(u2) {
 pub const SequenceRecord = struct { // max 228 bits
     const Self = @This();
     const Engine = henc.StructEncoderBuilder(Self);
+    pub const max_encoded_size = Engine.max_encoded_size;
 
     id: SequenceId,
     length: u64, // real length, not encoded length
@@ -87,7 +89,7 @@ pub const SequenceRecord = struct { // max 228 bits
     reference: ?SequenceId,
 
     pub fn Encode(self: Self) ![]const u8 {
-        var buffer: [Engine.max_encoded_size]u8 = undefined;
+        var buffer: [max_encoded_size]u8 = undefined;
         return try Engine.Encode(self, &buffer);
     }
 
@@ -102,13 +104,14 @@ pub const SequenceRecord = struct { // max 228 bits
 pub const Extent = struct { // 96
     const Self = @This();
     const Engine = henc.StructEncoderBuilder(Self);
+    pub const max_encoded_size = Engine.max_encoded_size;
 
     first_page: PageId, // Stable id
     page_length: u32, // How many pages are used (even partially)
     page_unused: u32, // How much of the last page is leftover
 
     pub fn Encode(self: Self) ![]const u8 {
-        var buffer: [Engine.max_encoded_size]u8 = undefined;
+        var buffer: [max_encoded_size]u8 = undefined;
         return try Engine.Encode(self, &buffer);
     }
 
@@ -129,12 +132,13 @@ pub const TransactionState = enum(u3) {
 pub const Transaction = struct {
     const Self = @This();
     const Engine = henc.StructEncoderBuilder(Self);
+    pub const max_encoded_size = Engine.max_encoded_size;
 
     state: TransactionState,
     record: SequenceRecord,
 
     pub fn Encode(self: Self) ![]const u8 {
-        var buffer: [Engine.max_encoded_size]u8 = undefined;
+        var buffer: [max_encoded_size]u8 = undefined;
         return try Engine.Encode(self, &buffer);
     }
 
@@ -146,13 +150,14 @@ pub const Transaction = struct {
 pub const Index = struct {
     const Self = @This();
     const Engine = henc.StructEncoderBuilder(Self);
+    pub const max_encoded_size = Engine.max_encoded_size;
 
     id: SequenceId,
     offset: u64,
     length: u32,
 
     pub fn Encode(self: Self) ![]const u8 {
-        var buffer: [Engine.max_encoded_size]u8 = undefined;
+        var buffer: [max_encoded_size]u8 = undefined;
         return try Engine.Encode(self, &buffer);
     }
 

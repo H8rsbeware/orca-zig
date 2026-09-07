@@ -52,12 +52,40 @@ pub const MetaFile = struct {
 
     file: std.Io.File,
     header: headers.FileHeader,
+    header_offset: usize,
 
-    pub fn GetRecordById(self: Self, index: *IndexFile, id: headers.SequenceId) !headers.SequenceRecord {
-        _ = self;
-        _ = index;
-        _ = id;
-        return error.NotImplemented;
+    pub fn init(io: std.Io, file: std.Io.File) !Self {
+        const max_header_size = headers.FileHeader.max_encoded_size;
+
+        var file_buff: [max_header_size]u8 = undefined;
+        const init_read_size = try file.readPositional(io, &.{file_buff[0..]}, 0);
+
+        const header_info = try headers.FileHeader.Decode(&file_buff[0..init_read_size]);
+
+        if (header_info.value.kind != .META_DATA) {
+            return error.FileHeaderKindMismatch;
+        }
+
+        return .{
+            .file = file,
+            .header = header_info.value,
+            .header_offset = header_info.cursor,
+        };
+    }
+
+    pub fn GetRecordById(self: Self, io: std.Io, index: *IndexFile, id: headers.SequenceId) !headers.SequenceRecord {
+        const max_sequence_length = headers.SequenceRecord.max_encoded_size;
+        const idx = try index.GetRecordIndex(id);
+
+        if (idx.offset < self.header_offset or idx.length > max_sequence_length) {
+            unreachable;
+        }
+
+        var read_buffer: [max_sequence_length]u8 = undefined;
+        const read_size = try self.file.readPositional(io, &.{read_buffer[0..]}, 0);
+
+        const meta_info = try headers.SequenceRecord.Decode(&read_buffer[0..read_size]);
+        return meta_info.value;
     }
 };
 
@@ -75,20 +103,41 @@ pub const IndexFile = struct {
     state: std.AutoHashMap(headers.SequenceId, IndexEntry),
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File) Self {
-        var file_buff: [1028]u8 = undefined;
-        _ = try file.file.readPositional(io, &.{file_buff[0..]}, 0);
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File) !Self {
+        const file_length = try file.length(io);
+        const max_read_size: usize = @max(
+            headers.FileHeader.max_encoded_size,
+            headers.Index.max_encoded_size,
+        );
 
-        // Decode should fail once magic exists
-        const decode = try headers.FileHeader.Decode(&file_buff);
+        var file_buff: [max_read_size]u8 = undefined;
+        const init_read_size = try file.readPositional(io, &.{file_buff[0..]}, 0);
 
-        // TODO: continue
+        const header_info = try headers.FileHeader.Decode(&file_buff[0..init_read_size]);
+
+        if (header_info.value.kind != .INDEX_DATA) {
+            return error.FileHeaderKindMismatch;
+        }
+
+        var current_cursor = header_info.cursor;
+
+        var map = std.AutoHashMap(headers.SequenceId, IndexEntry).init(allocator);
+        errdefer map.deinit();
+
+        while (current_cursor < file_length) {
+            const read_size = try file.readPositional(io, &.{file_buff}, current_cursor);
+
+            const index_info = try headers.Index.Decode(&file_buff[0..read_size]);
+            try map.put(index_info.value.id, .{ .length = index_info.value.offset, .offset = index_info.value.offset });
+
+            current_cursor += index_info.cursor;
+        }
 
         return .{
             .file = file,
-            .header = decode.value,
+            .header = header_info.value,
             .allocator = allocator,
-            .state = std.AutoHashMap(headers.SequenceId, IndexEntry).init(allocator),
+            .state = map,
         };
     }
 
@@ -96,9 +145,21 @@ pub const IndexFile = struct {
         self.state.deinit();
     }
 
-    pub fn GetRecordOffset(self: Self, id: headers.SequenceId) !headers.SequenceRecord {
-        _ = self;
-        _ = id;
-        return error.NotImplemented;
+    pub fn GetRecordIndex(self: Self, id: headers.SequenceId) !headers.Index {
+        const entry = self.state.get(id);
+
+        if (entry == null) {
+            return error.SequenceDoesNotExist;
+        }
+
+        return .{ .id = id, .offset = entry.?.offset, .length = entry.?.length };
+    }
+
+    pub fn WriteRecordIndex(self: Self, index: headers.Index) !void {
+        if (self.state.get(index.id) != null) {
+            return error.SequenceAlreadyExists;
+        }
+
+        try self.state.put(index.id, .{ .length = index.length, .offset = index.offset });
     }
 };
