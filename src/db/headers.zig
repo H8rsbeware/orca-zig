@@ -20,12 +20,12 @@ pub fn assertIsHeaderType(comptime T: type) void {
     if (!has_encode or !has_decode) {
         @compileError("Type '" ++ @typeName(T) ++
             "' is missing Header methods. Must implement both " ++
-            "'pub fn Encode(self) []const u8' and 'pub fn Decode([]const u8) self'.");
+            "'pub fn Encode(self) []const u8' and 'pub fn Decode([]const u8) struct {value: self, cursor: usize}'.");
     }
 }
 
-const PageId = u32;
-const SequenceId = u32;
+pub const PageId = u32;
+pub const SequenceId = u32;
 
 /// File type with top header of DB files
 pub const DBFileType = enum(u3) {
@@ -33,6 +33,8 @@ pub const DBFileType = enum(u3) {
     SEQUENCE_DATA = 0b001,
     ALIGNMENT_DATA = 0b010,
     COLD_DATA = 0b011,
+    TRANSACTIONS_STATE = 0b100,
+    INDEX_DATA = 0b101,
     // reserve rest
 };
 
@@ -42,7 +44,6 @@ pub const DBFileType = enum(u3) {
 pub const FileHeader = struct { // 83
     const Self = @This();
     const Engine = henc.StructEncoderBuilder(Self);
-    const byteSize = (@bitSizeOf(Self) + 7) / 8;
 
     version: u8,
     kind: DBFileType,
@@ -50,40 +51,47 @@ pub const FileHeader = struct { // 83
     generation: u64,
 
     pub fn Encode(self: Self) ![]const u8 {
-        var buffer: [byteSize]u8 = undefined;
+        var buffer: [Engine.max_encoded_size]u8 = undefined;
         return try Engine.Encode(self, &buffer);
     }
 
-    pub fn Decode(slice: []const u8) !Self {
+    pub fn Decode(slice: []const u8) !henc.DecodeResult(Self) {
         return try Engine.Decode(slice);
     }
 };
 
 /// Sequences encoding type within DB
-const SequenceEncoding = enum(u2) {
+pub const SequenceEncoding = enum(u2) {
     BIT_2,
     BIT3_REFERENCED,
     // reserve rest
 };
 
+pub const SequenceState = enum(u2) {
+    RESERVED = 0b00,
+    DELETED = 0b01,
+    ACTIVE = 0b10,
+    // reserved
+};
+
 /// Meta data for a sequence, determining what, where, and how long sequences are.
-pub const SequenceRecord = struct { // max 226 bits
+pub const SequenceRecord = struct { // max 228 bits
     const Self = @This();
     const Engine = henc.StructEncoderBuilder(Self);
-    const byteSize = (@bitSizeOf(Self) + 7) / 8;
 
     id: SequenceId,
     length: u64, // real length, not encoded length
+    state: SequenceState,
     encoding: SequenceEncoding,
     payload: Extent, // encoded position and length
     reference: ?SequenceId,
 
     pub fn Encode(self: Self) ![]const u8 {
-        var buffer: [byteSize]u8 = undefined;
+        var buffer: [Engine.max_encoded_size]u8 = undefined;
         return try Engine.Encode(self, &buffer);
     }
 
-    pub fn Decode(slice: []const u8) !Self {
+    pub fn Decode(slice: []const u8) !henc.DecodeResult(Self) {
         return try Engine.Decode(slice);
     }
 };
@@ -91,21 +99,64 @@ pub const SequenceRecord = struct { // max 226 bits
 /// Records the start and end page of a given sequence and how much of the
 /// last page remains.
 /// sequence length == (page_length * (1 << page_shift)) - page_unused
-const Extent = struct { // 96
+pub const Extent = struct { // 96
     const Self = @This();
     const Engine = henc.StructEncoderBuilder(Self);
-    const byteSize = (@bitSizeOf(Self) + 7) / 8;
 
     first_page: PageId, // Stable id
     page_length: u32, // How many pages are used (even partially)
     page_unused: u32, // How much of the last page is leftover
 
     pub fn Encode(self: Self) ![]const u8 {
-        var buffer: [byteSize]u8 = undefined;
+        var buffer: [Engine.max_encoded_size]u8 = undefined;
         return try Engine.Encode(self, &buffer);
     }
 
-    pub fn Decode(slice: []const u8) !Self {
+    pub fn Decode(slice: []const u8) !henc.DecodeResult(Self) {
+        return try Engine.Decode(slice);
+    }
+};
+
+pub const TransactionState = enum(u3) {
+    TRANSACTION = 0b000,
+    INDEXED = 0b001,
+    RECORDED = 0b010,
+    CREATED = 0b011,
+    DONE = 0b100,
+    // reserved
+};
+
+pub const Transaction = struct {
+    const Self = @This();
+    const Engine = henc.StructEncoderBuilder(Self);
+
+    state: TransactionState,
+    record: SequenceRecord,
+
+    pub fn Encode(self: Self) ![]const u8 {
+        var buffer: [Engine.max_encoded_size]u8 = undefined;
+        return try Engine.Encode(self, &buffer);
+    }
+
+    pub fn Decode(slice: []const u8) !henc.DecodeResult(Self) {
+        return try Engine.Decode(slice);
+    }
+};
+
+pub const Index = struct {
+    const Self = @This();
+    const Engine = henc.StructEncoderBuilder(Self);
+
+    id: SequenceId,
+    offset: u64,
+    length: u32,
+
+    pub fn Encode(self: Self) ![]const u8 {
+        var buffer: [Engine.max_encoded_size]u8 = undefined;
+        return try Engine.Encode(self, &buffer);
+    }
+
+    pub fn Decode(slice: []const u8) !henc.DecodeResult(Self) {
         return try Engine.Decode(slice);
     }
 };

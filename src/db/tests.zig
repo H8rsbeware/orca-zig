@@ -22,7 +22,8 @@ test "FileHeader_encodes_and_decodes_same" {
     var fh: headers.FileHeader = .{ .version = 10, .kind = headers.DBFileType.SEQUENCE_DATA, .page_shift = 12, .generation = 3 };
 
     const enc: []const u8 = try fh.Encode();
-    const dec: headers.FileHeader = try headers.FileHeader.Decode(enc);
+    const dec_union = try headers.FileHeader.Decode(enc);
+    const dec = dec_union.value;
 
     try std.testing.expectEqualDeep(fh, dec);
 }
@@ -59,14 +60,15 @@ test "header_encoder_encodes_and_decodes_simple" {
     try std.testing.expectEqual(@as(usize, 47), encoded_slice.len);
 
     const decoded_data = try Encoder.Decode(encoded_slice);
+    const decoded_value = decoded_data.value;
 
-    try std.testing.expectEqual(my_s.id, decoded_data.id);
-    try std.testing.expectEqual(my_s.length, decoded_data.length);
-    try std.testing.expectEqual(my_s.big, decoded_data.big);
-    try std.testing.expectEqual(my_s.small, decoded_data.small);
+    try std.testing.expectEqual(my_s.id, decoded_value.id);
+    try std.testing.expectEqual(my_s.length, decoded_value.length);
+    try std.testing.expectEqual(my_s.big, decoded_value.big);
+    try std.testing.expectEqual(my_s.small, decoded_value.small);
 
     std.debug.print("SIMPLE E-D TEST\n-----------\n", .{});
-    enc_dec_test_printer(my_s, encoded_slice, decoded_data);
+    enc_dec_test_printer(my_s, encoded_slice, decoded_value);
 }
 
 const ComplexStruct = struct {
@@ -99,9 +101,10 @@ test "header_encoder_encodes_and_decodes_optional_recursive" {
     try std.testing.expectEqual(@intFromPtr(&memory_pool[0]), @intFromPtr(&encoded_slice[0]));
 
     const decoded_data = try Encoder.Decode(encoded_slice);
+    const decoded_value = decoded_data.value;
 
-    try std.testing.expectEqualDeep(my_s, decoded_data);
+    try std.testing.expectEqualDeep(my_s, decoded_value);
 
     std.debug.print("RECURSIVE E-D TEST\n-----------\n", .{});
-    enc_dec_test_printer(my_s, encoded_slice, decoded_data);
+    enc_dec_test_printer(my_s, encoded_slice, decoded_value);
 }

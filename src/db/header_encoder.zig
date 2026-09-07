@@ -8,6 +8,13 @@ const std = @import("std");
 //
 // independent positions must be accessible independently - i.e var chars can be checked fast
 
+pub fn DecodeResult(comptime T: type) type {
+    return struct {
+        value: T,
+        cursor: usize,
+    };
+}
+
 const FieldContext = struct {
     type: type,
     name: []const u8,
@@ -23,23 +30,29 @@ pub fn StructEncoderBuilder(
     const meta = evalutateFields(Struct);
 
     // Calculate the number of optional fields, and calculate its byte aligned length.
-    const optional_count = comptime blk: {
+    const opt_count = comptime blk: {
         var count: usize = 0;
         for (meta) |f| {
             if (f.optional) count += 1;
         }
         break :blk count;
     };
-    const bitmask_bytes_len = (optional_count + 7) / 8;
+
+    const bitmask_bytes_len = (opt_count + 7) / 8;
+    const max_size = maxEncodedSize(&meta);
 
     return struct {
-        /// Encode a struct of uints, unint enums, and structs of the same form using ULEB128,
-        /// with byte aligned optional marks (whether the optional fields are set) appended to the end.
-        pub fn Encode(instance: Struct, out_buffer: []u8) ![]const u8 {
-            var cursor: usize = 0;
+        pub const max_encoded_size = max_size;
+        pub const optional_count = opt_count;
 
-            // Create a bitmask representing optional fields where 1 is value set, and 0 is value null
-            var bitmask_buff = [_]u8{0} ** ((optional_count + 7) / 8);
+        /// Encode a struct of uints, unint enums, and structs of the same form using ULEB128,
+        /// with byte aligned optional marks (whether the optional fields are set) prepended to the start.
+        pub fn Encode(instance: Struct, out_buffer: []u8) ![]const u8 {
+            if (out_buffer.len < bitmask_bytes_len) return error.NoSpaceLeft;
+
+            @memset(out_buffer[0..bitmask_bytes_len], 0);
+
+            var cursor: usize = bitmask_bytes_len;
             var bit_idx: usize = 0;
 
             inline for (meta) |field| {
@@ -55,7 +68,7 @@ pub fn StructEncoderBuilder(
                             const byte_pos = bit_idx / 8;
                             const bit_pos = @as(u3, @intCast(bit_idx % 8));
                             // in current mask byte, set the bit at bit_pos to a 1
-                            bitmask_buff[byte_pos] |= (@as(u8, 1) << bit_pos);
+                            out_buffer[byte_pos] |= (@as(u8, 1) << bit_pos);
                         }
                         bit_idx += 1;
 
@@ -85,29 +98,32 @@ pub fn StructEncoderBuilder(
                 }
             }
 
-            // Append the optional marker bytes to the end of the buffer (ensuring it fits)
-            const payload_len = cursor;
-            if (payload_len + bitmask_bytes_len > out_buffer.len) return error.NoSpaceLeft;
-            @memcpy(out_buffer[payload_len .. payload_len + bitmask_bytes_len], &bitmask_buff);
-
-            return out_buffer[0 .. payload_len + bitmask_bytes_len];
+            return out_buffer[0..cursor];
         }
 
-        pub fn Decode(bytes: []const u8) !Struct {
+        pub fn Decode(bytes: []const u8) !DecodeResult(Struct) {
             var cursor: usize = 0;
-            return try decodeInternal(bytes, &cursor);
+            const value = try decodeInternal(bytes, &cursor);
+
+            return .{
+                .value = value,
+                .cursor = cursor,
+            };
         }
 
         fn decodeInternal(bytes: []const u8, shared_cursor: *usize) !Struct {
-            if (bytes.len < bitmask_bytes_len) return error.InputTooShort;
+            if (shared_cursor.* > bytes.len) return error.InputTooShort;
 
-            const current_payloads = bytes[shared_cursor.*..];
+            if (bytes.len - shared_cursor.* < bitmask_bytes_len) {
+                return error.InputTooShort;
+            }
 
-            // Find the end of the encoded data / start of the optional markers,
-            // and split `payload <> optional_markers` into their own slices.
-            const payload_end = current_payloads.len - bitmask_bytes_len;
-            const bitmask_slice = current_payloads[payload_end..];
-            const payload_bytes = current_payloads[0..payload_end];
+            const current_bytes = bytes[shared_cursor.*..];
+
+            // Find the start of the encoded data / end of the optional markers,
+            // and split `optional_markers <> payload` into their own slices.
+            const bitmask_slice = current_bytes[0..bitmask_bytes_len];
+            const payload_bytes = current_bytes[bitmask_bytes_len..];
 
             // We build a set of flags for fields that are set, to rebuild against.
             // Non-optional data are considered always present.
@@ -129,7 +145,8 @@ pub fn StructEncoderBuilder(
                 }
             }
 
-            // We keep a local cursor over our current payload to append and return to the shared one (for recusive structs)
+            // We keep a cursor relative to the payload_bytes, i.e. it doesnt include the optional markers,
+            // and we instead add it when updating shared_cursor
             var local_cursor: usize = 0;
             var instance: Struct = undefined;
 
@@ -173,7 +190,7 @@ pub fn StructEncoderBuilder(
             }
 
             // update our shared pointer so any parents can continue from the correct position
-            shared_cursor.* += local_cursor + bitmask_bytes_len;
+            shared_cursor.* += bitmask_bytes_len + local_cursor;
 
             return instance;
         }
@@ -200,14 +217,13 @@ pub fn StructEncoderBuilder(
         /// Intermidate reader, that either calls readULEB on T with >7 bits,
         /// or truncates it directly from its u8 form to T.
         fn read(comptime T: type, buffer: []const u8, cursor: *usize) !T {
-            const TSize = @bitSizeOf(T);
             if (@bitSizeOf(T) <= 7) {
                 if (cursor.* >= buffer.len) return error.EndOfStream;
 
                 const byte = buffer[cursor.*];
                 cursor.* += 1;
 
-                if (byte > std.math.pow(u8, TSize - 1, 2)) {
+                if (byte > @as(u8, @intCast(std.math.maxInt(T)))) {
                     return error.EncodedValueTooWide;
                 }
 
@@ -338,6 +354,37 @@ fn evalutateFields(comptime hdr_raw: type) [@typeInfo(unwrapOptional(hdr_raw)).@
     }
 
     return field_list;
+}
+
+fn maxEncodedSize(comptime meta: []const FieldContext) usize {
+    var size: usize = 0;
+    var opt_count: usize = 0;
+
+    for (meta) |f| {
+        if (f.optional) opt_count += 1;
+
+        const FieldType = unwrapOptional(f.type);
+        const info = @typeInfo(FieldType);
+
+        switch (info) {
+            .int => {
+                size += (@bitSizeOf(FieldType) + 6) / 7;
+            },
+
+            .@"enum" => |enum_info| {
+                size += (@bitSizeOf(enum_info.tag_type) + 6) / 7;
+            },
+
+            .@"struct" => {
+                size += maxEncodedSize(f.shape.?);
+            },
+
+            else => unreachable,
+        }
+    }
+
+    size += (opt_count + 7) / 8;
+    return size;
 }
 
 /// Retrieve the type from an optional field, or return the type.

@@ -1,4 +1,4 @@
 
 store/
-
+.zig-cache/
 test_data/
