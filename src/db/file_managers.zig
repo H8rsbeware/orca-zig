@@ -68,7 +68,7 @@ pub const TransactionFile = struct {
         };
     }
 
-    pub fn UpdateTransaction(self: Self, io: std.Io, index: TransactionIndex, new_state: headers.TransactionState) !TransactionIndex {
+    pub fn UpdateTransaction(self: *Self, io: std.Io, index: *TransactionIndex, new_state: headers.TransactionState) !TransactionIndex {
         index.transaction.*.state = new_state;
 
         const new_buffer = try index.transaction.Encode();
@@ -82,8 +82,8 @@ pub const TransactionFile = struct {
         return index;
     }
 
-    pub fn WriteTransaction(self: Self, io: std.Io, transaction: *headers.Transaction) !TransactionIndex {
-        const current_length = self.file.length(io);
+    pub fn WriteTransaction(self: *Self, io: std.Io, transaction: *const headers.Transaction) !TransactionIndex {
+        const current_length = try self.file.length(io);
 
         const buffer = try transaction.Encode();
 
@@ -96,7 +96,7 @@ pub const TransactionFile = struct {
         };
     }
 
-    fn CleanTransactions(io: std.Io, allocator: std.mem.Allocator, path: []const u8, header: headers.FileHeader, transactions: std.AutoHashMap(TransactionIndex, headers.Transaction)) !std.AutoHashMap(TransactionIndex, headers.Transaction) {
+    fn CleanTransactions(io: std.Io, allocator: std.mem.Allocator, path: []const u8, header: *const headers.FileHeader, transactions: *const std.AutoHashMap(TransactionIndex, headers.Transaction)) !std.AutoHashMap(TransactionIndex, headers.Transaction) {
         var iter = transactions.iterator();
 
         const parent_path = std.Io.Dir.path.dirname(path) orelse return error.InvalidPath;
@@ -157,7 +157,7 @@ pub const MetaFile = struct {
         };
     }
 
-    pub fn GetRecordById(self: Self, io: std.Io, index: *IndexFile, id: headers.SequenceId) !headers.SequenceRecord {
+    pub fn GetRecordById(self: *Self, io: std.Io, index: *const IndexFile, id: headers.SequenceId) !headers.SequenceRecord {
         const max_sequence_length = headers.SequenceRecord.max_encoded_size;
         const idx = try index.GetRecordIndex(id);
 
@@ -187,7 +187,9 @@ pub const IndexFile = struct {
     state: std.AutoHashMap(headers.SequenceId, IndexEntry),
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File) !Self {
+    next_sequence_id: u64,
+
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File) !Self {
         const file_length = try file.length(io);
         const max_read_size: usize = @max(
             MaxFileHeaderSize,
@@ -208,12 +210,15 @@ pub const IndexFile = struct {
         var map = std.AutoHashMap(headers.SequenceId, IndexEntry).init(allocator);
         errdefer map.deinit();
 
+        var max_id: u64 = 0;
+
         while (current_cursor < file_length) {
             const read_size = try file.readPositional(io, &.{file_buff}, current_cursor);
 
             const index_info = try headers.Index.Decode(&file_buff[0..read_size]);
             try map.put(index_info.value.id, .{ .length = index_info.value.offset, .offset = index_info.value.offset });
 
+            max_id = @max(max_id, index_info.value.id);
             current_cursor += index_info.cursor;
         }
 
@@ -222,14 +227,15 @@ pub const IndexFile = struct {
             .header = header_info.value,
             .allocator = allocator,
             .state = map,
+            .next_sequence_id = max_id + 1,
         };
     }
 
-    pub fn deinit(self: Self) void {
+    pub fn deinit(self: *Self) void {
         self.state.deinit();
     }
 
-    pub fn GetRecordIndex(self: Self, id: headers.SequenceId) !headers.Index {
+    pub fn GetRecordIndex(self: *const Self, id: headers.SequenceId) !headers.Index {
         const entry = self.state.get(id);
 
         if (entry == null) {
@@ -239,12 +245,16 @@ pub const IndexFile = struct {
         return .{ .id = id, .offset = entry.?.offset, .length = entry.?.length };
     }
 
-    pub fn WriteRecordIndex(self: Self, index: headers.Index) !void {
+    pub fn WriteRecordIndex(self: *Self, index: *const headers.Index) !void {
         if (self.state.get(index.id) != null) {
             return error.SequenceAlreadyExists;
         }
 
         try self.state.put(index.id, .{ .length = index.length, .offset = index.offset });
+    }
+
+    pub fn GetNextId(self: *const Self) u64 {
+        return self.next_sequence_id;
     }
 };
 
@@ -266,7 +276,7 @@ const PageReservation = struct {
     length: usize,
 };
 
-const SequenceFile = struct {
+pub const SequenceFile = struct {
     const Self = @This();
 
     file: std.Io.File,
@@ -304,11 +314,15 @@ const SequenceFile = struct {
         };
     }
 
-    pub fn deinit(self: Self) void {
+    pub fn deinit(self: *Self) void {
         self.reserved.deinit();
     }
 
-    pub fn Reserve(self: Self, data_length: usize) !PageReservation {
+    pub fn NextPage(self: *const Self) u64 {
+        return self.current_next_page;
+    }
+
+    pub fn Reserve(self: *Self, data_length: usize) !PageReservation {
         const as_pages = try std.math.divCeil(usize, data_length, self.page_length);
         const page_to_provide = self.current_next_page;
 
@@ -325,7 +339,7 @@ const SequenceFile = struct {
         return pr;
     }
 
-    pub fn WriteSequence(self: Self, io: std.Io, data: []const u8, reservation: PageReservation) !usize {
+    pub fn WriteSequence(self: *Self, io: std.Io, data: []const u8, reservation: *const PageReservation) !usize {
         if (self.reserved.get(reservation) == null) {
             return error.PageReservationNotFound;
         }
@@ -341,25 +355,32 @@ const SequenceFile = struct {
         return write_len;
     }
 
-    pub fn ReadSequenceWithReservation(self: Self, io: std.Io, reservation: PageReservation, offset: usize) ![]const u8 {
-        return try self.ReadSequence(io, reservation.start, reservation.length, offset);
+    pub fn ReadSequenceWithReservation(self: *Self, io: std.Io, reservation: *const PageReservation, offset: usize) ![]const u8 {
+        return try self.ReadSequence(
+            io,
+            .{
+                .file_page = reservation.start,
+                .page_length = reservation.length,
+                .page_unused = offset,
+            },
+        );
     }
 
-    pub fn ReadSequence(self: Self, io: std.Io, start_page: usize, page_length: usize, offset: usize) ![]const u8 {
-        if (start_page + page_length > self.current_next_page) {
+    pub fn ReadSequence(self: *const Self, io: std.Io, extent: *const headers.Extent) ![]const u8 {
+        if (extent.first_page + extent.page_length > self.current_next_page) {
             return error.PageOutOfBounds;
         }
 
-        const buffer_size = self.page_length * page_length;
+        const buffer_size = self.page_length * extent.page_length;
         const buffer: [buffer_size]u8 = undefined;
 
-        const start = self.page_length * start_page;
+        const start = self.page_length * extent.first_page;
         const read_len = try self.file.readPositional(io, &.{buffer[0..]}, start);
 
-        if (read_len < buffer_size - offset) {
+        if (read_len < buffer_size - extent.page_unused) {
             return error.SequenceIncomplete;
         }
 
-        return buffer[0..offset];
+        return buffer[0..extent.page_unused];
     }
 };
