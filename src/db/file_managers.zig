@@ -20,41 +20,14 @@ pub const TransactionFile = struct {
     allocator: std.mem.Allocator,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, file_name: []const u8) !Self {
-        var file = dir.openFile(io, file_name, .{}) catch |err| switch (err) {
-            error.FileNotFound => {
-                var f = try dir.createFile(io, file_name, .{});
-
-                const file_header: headers.FileHeader = .{
-                    .page_shift = DefaultPageShift,
-                    .generation = 0,
-                    .kind = .TRANSACTIONS_STATE,
-                    .version = 1,
-                };
-
-                const encoded = try file_header.Encode();
-                try f.writePositionalAll(io, encoded.slice(), 0);
-                return f;
-            },
-            else => return err,
-        };
+        const file = try openOrCreateFile(io, dir, file_name, .TRANSACTIONS_STATE);
         errdefer file.close(io);
 
-        // read the current file header and data into a map of transactions
         const file_length = try file.length(io);
-        const max_buffer_size = @max(
-            MaxFileHeaderSize,
-            headers.Transaction.max_encoded_size,
-        );
-
-        var file_buff: [max_buffer_size]u8 = undefined;
-        const init_read_len = try file.readPositional(io, &.{file_buff[0..]}, 0);
-
-        const header_info = try headers.FileHeader.Decode(&file_buff[0..init_read_len]);
-        if (header_info.value.kind != .TRANSACTIONS_STATE) {
-            return error.FileHeaderKindMismatch;
-        }
-
+        const header_info = try decodeAndEnsureHeaderFile(io, file, .TRANSACTIONS_STATE);
         var current_cursor = header_info.cursor;
+
+        var file_buff: [headers.Transaction.max_encoded_size]u8 = undefined;
 
         var map = std.AutoHashMap(TransactionIndex, headers.Transaction).init(allocator);
         errdefer map.deinit();
@@ -178,33 +151,10 @@ pub const MetaFile = struct {
     current_next: usize,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, file_name: []const u8) !Self {
-        const file = dir.openFile(io, file_name, .{}) catch |err| switch (err) {
-            error.FileNotFound => {
-                var f = try dir.createFile(io, file_name, .{});
-
-                const file_header: headers.FileHeader = .{
-                    .page_shift = DefaultPageShift,
-                    .generation = 0,
-                    .kind = .META_DATA,
-                    .version = 1,
-                };
-
-                const encoded = try file_header.Encode();
-                try f.writePositionalAll(io, encoded.slice(), 0);
-                return f;
-            },
-            else => return err,
-        };
+        const file = try openOrCreateFile(io, dir, file_name, .META_DATA);
         errdefer file.close(io);
 
-        var file_buff: [MaxFileHeaderSize]u8 = undefined;
-        const init_read_size = try file.readPositional(io, &.{file_buff[0..]}, 0);
-
-        const header_info = try headers.FileHeader.Decode(&file_buff[0..init_read_size]);
-
-        if (header_info.value.kind != .META_DATA) {
-            return error.FileHeaderKindMismatch;
-        }
+        const header_info = try decodeAndEnsureHeaderFile(io, file, .META_DATA);
 
         const file_length = try file.length(io);
         return .{
@@ -310,51 +260,24 @@ pub const IndexFile = struct {
     next_sequence_id: headers.SequenceId,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, file_name: []const u8) !Self {
-        const file = dir.openFile(io, file_name, .{}) catch |err| switch (err) {
-            error.FileNotFound => {
-                var f = try dir.createFile(io, file_name, .{});
-
-                const file_header: headers.FileHeader = .{
-                    .page_shift = DefaultPageShift,
-                    .generation = 0,
-                    .kind = .META_DATA,
-                    .version = 1,
-                };
-
-                const encoded = try file_header.Encode();
-                try f.writePositionalAll(io, encoded.slice(), 0);
-                return f;
-            },
-            else => return err,
-        };
+        const file = try openOrCreateFile(io, dir, file_name, .INDEX_DATA);
         errdefer file.close(io);
 
         const file_length = try file.length(io);
-        const max_read_size: usize = @max(
-            MaxFileHeaderSize,
-            headers.Index.max_encoded_size,
-        );
 
-        var file_buff: [max_read_size]u8 = undefined;
-        const init_read_size = try file.readPositional(io, &.{file_buff[0..]}, 0);
-
-        const header_info = try headers.FileHeader.Decode(&file_buff[0..init_read_size]);
-
-        if (header_info.value.kind != .INDEX_DATA) {
-            return error.FileHeaderKindMismatch;
-        }
-
+        const header_info = try decodeAndEnsureHeaderFile(io, file, .INDEX_DATA);
         var current_cursor = header_info.cursor;
 
         var map = std.AutoHashMap(headers.SequenceId, IndexEntry).init(allocator);
         errdefer map.deinit();
 
         var max_id: headers.SequenceId = 0;
+        var file_buffer: [headers.Index.max_encoded_size]u8 = undefined;
 
         while (current_cursor < file_length) {
-            const read_size = try file.readPositional(io, &.{file_buff}, current_cursor);
+            const read_size = try file.readPositional(io, &.{file_buffer}, current_cursor);
 
-            const index_info = try headers.Index.Decode(&file_buff[0..read_size]);
+            const index_info = try headers.Index.Decode(&file_buffer[0..read_size]);
             try map.put(index_info.value.id, .{ .length = index_info.cursor, .offset = index_info.value.offset });
 
             max_id = @max(max_id, index_info.value.id);
@@ -427,32 +350,10 @@ pub const SequenceFile = struct {
     current_next_page: usize,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, file_name: []const u8) !Self {
-        const file = dir.openFile(io, file_name, .{}) catch |err| switch (err) {
-            error.FileNotFound => {
-                var f = try dir.createFile(io, file_name, .{});
-
-                const file_header: headers.FileHeader = .{
-                    .page_shift = DefaultPageShift,
-                    .generation = 0,
-                    .kind = .META_DATA,
-                    .version = 1,
-                };
-
-                const encoded = try file_header.Encode();
-                try f.writePositionalAll(io, encoded.slice(), 0);
-                return f;
-            },
-            else => return err,
-        };
+        const file = try openOrCreateFile(io, dir, file_name, .SEQUENCE_DATA);
         errdefer file.close(io);
 
-        var file_buff: [MaxFileHeaderSize]u8 = undefined;
-        const init_read_size = try file.readPositional(io, &.{file_buff[0..]}, 0);
-
-        const header_info = try headers.FileHeader.Decode(&file_buff[0..init_read_size]);
-        if (header_info.value.kind != .SEQUENCE_DATA) {
-            return error.FileHeaderKindMismatch;
-        }
+        const header_info = try decodeAndEnsureHeaderFile(io, file, .SEQUENCE_DATA);
 
         const page_length: usize = 1 << header_info.value.page_shift;
         const header_len_as_pages = try std.math.divCeil(usize, header_info.cursor, page_length);
@@ -550,3 +451,36 @@ pub const SequenceFile = struct {
         return page_bits - data_length;
     }
 };
+
+fn openOrCreateFile(io: std.Io, dir: std.Io.File, file_name: []const u8, fileType: headers.DBFileType) !std.Io.File {
+    return dir.openFile(io, file_name, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            var f = try dir.createFile(io, file_name, .{});
+
+            const file_header: headers.FileHeader = .{
+                .page_shift = DefaultPageShift,
+                .generation = 0,
+                .kind = fileType,
+                .version = 1,
+            };
+
+            const encoded = try file_header.Encode();
+            try f.writePositionalAll(io, encoded.slice(), 0);
+            return f;
+        },
+        else => return err,
+    };
+}
+
+fn decodeAndEnsureHeaderFile(io: std.Io, file: std.Io.File, expectedFileType: headers.DBFileType) !headers.FileHeader {
+    var file_buff: [MaxFileHeaderSize]u8 = undefined;
+    const init_read_size = try file.readPositional(io, &.{file_buff[0..]}, 0);
+
+    const header_info = try headers.FileHeader.Decode(&file_buff[0..init_read_size]);
+
+    if (header_info.value.kind != expectedFileType) {
+        return error.FileHeaderKindMismatch;
+    }
+
+    return header_info;
+}
