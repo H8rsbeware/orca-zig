@@ -8,10 +8,21 @@ const std = @import("std");
 //
 // independent positions must be accessible independently - i.e var chars can be checked fast
 
-pub fn DecodeResult(comptime T: type) type {
+pub fn Decoded(comptime T: type) type {
     return struct {
         value: T,
         cursor: usize,
+    };
+}
+
+pub fn Encoded(comptime M: usize) type {
+    return struct {
+        buffer: [M]u8,
+        len: usize,
+
+        pub fn slice(self: *const @This()) []const u8 {
+            return self.buffer[0..self.len];
+        }
     };
 }
 
@@ -101,7 +112,7 @@ pub fn StructEncoderBuilder(
             return out_buffer[0..cursor];
         }
 
-        pub fn Decode(bytes: []const u8) !DecodeResult(Struct) {
+        pub fn Decode(bytes: []const u8) !Decoded(Struct) {
             var cursor: usize = 0;
             const value = try decodeInternal(bytes, &cursor);
 
@@ -113,7 +124,6 @@ pub fn StructEncoderBuilder(
 
         fn decodeInternal(bytes: []const u8, shared_cursor: *usize) !Struct {
             if (shared_cursor.* > bytes.len) return error.InputTooShort;
-
             if (bytes.len - shared_cursor.* < bitmask_bytes_len) {
                 return error.InputTooShort;
             }
@@ -167,7 +177,7 @@ pub fn StructEncoderBuilder(
                         const T = unwrapOptional(field.type);
                         const tag_type = @typeInfo(T).@"enum".tag_type;
                         const tag_value = try read(tag_type, payload_bytes, &local_cursor);
-                        @field(instance, field.name) = @as(T, @enumFromInt(tag_value));
+                        @field(instance, field.name) = try enumFromIntChecked(T, tag_value);
                     } else if (field.shape != null) {
                         // For child structs, we need to get an encoder for their type, get the slice from current position onwards,
                         // and then provide the child with its own cursor.
@@ -266,11 +276,21 @@ pub fn StructEncoderBuilder(
             while (true) {
                 if (cursor.* >= buffer.len) return error.EndOfStream;
 
+                // check we havent got more bytes than T can contain
+                if (shift > @bitSizeOf(T)) return error.EncodedValueTooWide;
+
                 const byte = buffer[cursor.*];
                 cursor.* += 1;
 
                 const chunk = @as(T, (byte & 0b0111_1111)); // 0x7F
-                result |= chunk << @intCast(shift);
+
+                // shift the chunk and check that there is no overflow
+                // admittedly - i didnt know the proper way to do this, and asked an LLM
+                const shift_amount: std.math.Log2Int(T) = @intCast(shift);
+                const shifted = @shlWithOverflow(chunk, shift_amount);
+                if (shifted[1] != 0) return error.EncodedValueTooWide;
+
+                result |= shifted[0];
                 shift += 7;
 
                 if (byte & 0b1000_0000 == 0) break; //0x80
@@ -385,6 +405,14 @@ fn maxEncodedSize(comptime meta: []const FieldContext) usize {
 
     size += (opt_count + 7) / 8;
     return size;
+}
+
+fn enumFromIntChecked(comptime T: type, value: @typeInfo(T).@"enum".tag_type) !void {
+    inline for (@typeInfo(T).@"enum".fields) |f| {
+        if (value == f.value) return @enumFromInt(value);
+    }
+
+    return error.InvalidEnumTag;
 }
 
 /// Retrieve the type from an optional field, or return the type.

@@ -12,132 +12,123 @@ const AlignmentFile = "alignment.dat";
 const ColdFile = "cold.dat";
 const TransactionsFile = "transactions.dat";
 
+// Lifecycle
+//  Transaction created
+//  Space reserved in Meta, for Index
+//  Index created for reference
+//  Transaction Updated
+//  Space reserved in Sequence, for Meta
+//  Meta created for record
+//  Transaction Updated
+//  Sequence created with data
+//  Transaction Updated
+//
+//  Transaction Cleared down.
 pub const Database = struct {
     const Self = @This();
 
-    root: []const u8,
+    root: std.Io.Dir,
 
     meta_file: managers.MetaFile,
     index_file: managers.IndexFile,
     sequence_file: managers.SequenceFile,
-    alignment_file: type,
-    cold_file: type,
+    alignment_file: void,
+    cold_file: void,
     transactions_file: managers.TransactionFile,
 
-    next_sequence_id: u64,
+    next_sequence_id: headers.SequenceId,
 
-    pub fn init(io: std.Io, comptime config: app_c.DBConfig) !Self {
-        const db_root = config.db_location;
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, root: std.Io.Dir) !Self {
+        const file_sequence = try managers.SequenceFile.init(io, allocator, root, SequenceFile);
+        errdefer file_sequence.deinit(io);
 
-        comptime if (db_root[db_root.len - 1] != '/') {
-            @compileError("config.db_location must be a directory end with a '/'");
-        };
+        const file_meta = try managers.MetaFile.init(io, allocator, root, MetaFile);
+        errdefer file_meta.deinit(io);
 
-        const file_sequence = try initDbFile(io, db_root ++ SequenceFile, headers.DBFileType.SEQUENCE_DATA, DefaultPageShift);
-        const file_meta = try initDbFile(io, db_root ++ MetaFile, headers.DBFileType.META_DATA, DefaultPageShift);
-        const file_meta_index = try initDbFile(io, db_root ++ MetaIndexFile, headers.DBFileType.INDEX_DATA, DefaultPageShift);
-        const file_alignment = try initDbFile(io, db_root ++ AlignmentFile, headers.DBFileType.ALIGNMENT_DATA, DefaultPageShift);
-        const file_cold = try initDbFile(io, db_root ++ ColdFile, headers.DBFileType.COLD_DATA, DefaultPageShift);
-        const file_transactions = try initDbFile(io, db_root ++ TransactionsFile, headers.DBFileType.TRANSACTIONS_STATE, DefaultPageShift);
+        const file_meta_index = try managers.IndexFile.init(io, allocator, root, MetaIndexFile);
+        errdefer file_meta_index.deinit(io);
+
+        const file_transaction = try managers.TransactionFile.init(io, allocator, root, TransactionsFile);
+        errdefer file_transaction.deinit(io);
 
         return .{
-            .root = db_root,
+            .root = root,
             .meta_file = file_meta,
             .index_file = file_meta_index,
             .sequence_file = file_sequence,
-            .alignment_file = file_alignment,
-            .cold_file = file_cold,
-            .transactions_file = file_transactions,
+            .alignment_file = void,
+            .cold_file = void,
+            .transactions_file = file_transaction,
             .next_sequence_id = file_meta_index.GetNextId(),
         };
     }
 
     pub fn deinit(self: *Self, io: std.Io) void {
-        self.alignment_file.close(io);
-        self.cold_file.close(io);
-        self.sequence_file.close(io);
-        self.meta_file.close(io);
-        self.transactions_file.file.close(io);
+        self.meta_file.deinit(io);
+        self.sequence_file.deinit(io);
+        self.index_file.deinit(io);
+        self.transactions_file.deinit(io);
     }
 
     pub fn ReadSequence(self: *const Self, io: std.Io, id: headers.SequenceId) ![]const u8 {
-        const meta = try self.meta_file.GetRecordById(io, &self.meta_file, id);
+        const index = try self.index_file.GetRecordIndex(id);
+        const meta = try self.meta_file.GetRecordById(io, index);
         const sequence = try self.sequence_file.ReadSequence(io, meta.payload);
 
         return sequence;
     }
 
-    pub fn WriteSequence(self: *Self, io: std.Io, data: []const u8, real_length: u64, encoding: *const headers.SequenceEncoding, reference_id: ?headers.SequenceId) !void {
-        _ = self;
-        _ = io;
-        _ = data;
-        _ = real_length;
-        _ = encoding;
-        _ = reference_id;
-    }
+    pub fn WriteSequence(self: *Self, io: std.Io, data: []const u8, real_length: u64, encoding: *const headers.SequenceEncoding, reference_id: ?headers.SequenceId) !managers.TransactionIndex {
+        const data_length = data.len;
 
-    /// Initialises (opens or creates) a database file, and builds its corrosponding file_manager;
-    /// file managers check whether files are correct, and perform their own initialisation.
-    ///
-    /// i.e. the TranasactionFile manager checks its header, builds a map to cache transactions,
-    /// and then walks the transactions, recovering, reverting, or removing records depending on state.
-    fn initDbFile(io: std.Io, path: []const u8, file_type: headers.DBFileType, default_page_shift: u8) !type {
-        const opened_file = try openOrCreate(io, path);
-        errdefer opened_file.file.close(io);
+        const reserved_id = self.index_file.TakeNextId();
+        const reserved_seq_space = try self.sequence_file.Reserve(io, data_length);
 
-        // if the file is newly created, write the default header to it
-        if (opened_file.created) {
-            const file_header: headers.FileHeader = .{
-                .page_shift = default_page_shift,
-                .generation = 0,
-                .kind = file_type,
-                .version = 1,
-            };
+        const calculated_offset = self.sequence_file.CalcOffset(data_length, reserved_seq_space.length);
+        var record: headers.SequenceRecord = .{
+            .id = reserved_id,
+            .payload = .{
+                .first_page = reserved_seq_space.start,
+                .page_length = reserved_seq_space.length,
+                .page_unused = calculated_offset,
+            },
+            .length = real_length,
+            .state = .RESERVED,
+            .encoding = encoding.*,
+            .reference = reference_id,
+        };
 
-            const encoded = try file_header.Encode();
-            try opened_file.file.writePositionalAll(io, encoded, 0);
+        const transaction: headers.Transaction = .{
+            .state = .TRANSACTION,
+            .record = record,
+        };
+        var transaction_index = try self.transactions_file.WriteTransaction(io, &transaction);
+
+        const encoded = try record.Encode();
+        const reserved_meta_space = try self.meta_file.Reserve(encoded.len);
+
+        if (reserved_meta_space.length != encoded.len) {
+            unreachable;
         }
 
-        // file managers are responsible for ensuring initialisation is correct.
-        return switch (file_type) {
-            .META_DATA => try managers.MetaFile.init(io, opened_file.file),
-            .INDEX_DATA => try managers.IndexFile.init(io, std.heap.page_allocator, opened_file.file),
-            .TRANSACTIONS_STATE => try managers.TransactionFile.init(io, std.heap.page_allocator, opened_file.file, path),
-            .SEQUENCE_DATA => try managers.SequenceFile.init(io, std.heap.page_allocator, opened_file.file),
-            .ALIGNMENT_DATA => return {},
-            .COLD_DATA => return {},
+        const index: headers.Index = .{
+            .id = reserved_id,
+            .length = reserved_meta_space.length,
+            .offset = reserved_meta_space.offset,
         };
+        try self.index_file.WriteRecordIndex(&index);
+        transaction_index = try self.transactions_file.UpdateTransaction(io, &transaction_index, .INDEXED);
+
+        try self.meta_file.WriteToReservation(io, reserved_meta_space, &encoded.slice());
+        transaction_index = try self.transactions_file.UpdateTransaction(io, &transaction_index, .RECORDED);
+
+        try self.sequence_file.WriteSequence(io, data, reserved_seq_space);
+        transaction_index = try self.transactions_file.UpdateTransaction(io, &transaction_index, .CREATED);
+        // update the meta here
+        record.state = .ACTIVE;
+        try self.meta_file.UpdateMetaWithReservation(io, reserved_meta_space, &record);
+        transaction_index = try self.transactions_file.UpdateTransaction(io, &transaction_index, .DONE);
+
+        return transaction_index;
     }
 };
-
-const OpenedFile = struct {
-    file: std.Io.File,
-    created: bool,
-};
-
-fn openOrCreate(
-    io: std.Io,
-    path: []const u8,
-) !OpenedFile {
-    const file = std.Io.Dir.openFileAbsolute(io, path, .{
-        .mode = .read_write,
-    }) catch |err| switch (err) {
-        error.FileNotFound => {
-            const created = try std.Io.Dir.createFileAbsolute(io, path, .{
-                .exclusive = true,
-                .read = true,
-            });
-
-            return .{
-                .file = created,
-                .created = true,
-            };
-        },
-        else => return err,
-    };
-
-    return .{
-        .file = file,
-        .created = false,
-    };
-}

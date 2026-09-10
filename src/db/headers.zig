@@ -51,12 +51,16 @@ pub const FileHeader = struct { // 83
     page_shift: u8,
     generation: u64,
 
-    pub fn Encode(self: Self) ![]const u8 {
-        var buffer: [max_encoded_size]u8 = undefined;
-        return try Engine.Encode(self, &buffer);
+    pub fn Encode(self: Self) !henc.Encoded(max_encoded_size) {
+        var result: henc.Encoded(max_encoded_size) = undefined;
+
+        const encoded = try Engine.Encode(self, &result.buffer);
+        result.len = encoded.len;
+
+        return result;
     }
 
-    pub fn Decode(slice: []const u8) !henc.DecodeResult(Self) {
+    pub fn Decode(slice: []const u8) !henc.Decoded(Self) {
         return try Engine.Decode(slice);
     }
 };
@@ -88,12 +92,16 @@ pub const SequenceRecord = struct { // max 228 bits
     payload: Extent, // encoded position and length
     reference: ?SequenceId,
 
-    pub fn Encode(self: Self) ![]const u8 {
-        var buffer: [max_encoded_size]u8 = undefined;
-        return try Engine.Encode(self, &buffer);
+    pub fn Encode(self: Self) !henc.Encoded(max_encoded_size) {
+        var result: henc.Encoded(max_encoded_size) = undefined;
+
+        const encoded = try Engine.Encode(self, &result.buffer);
+        result.len = encoded.len;
+
+        return result;
     }
 
-    pub fn Decode(slice: []const u8) !henc.DecodeResult(Self) {
+    pub fn Decode(slice: []const u8) !henc.Decoded(Self) {
         return try Engine.Decode(slice);
     }
 };
@@ -110,12 +118,16 @@ pub const Extent = struct { // 96
     page_length: u32, // How many pages are used (even partially)
     page_unused: u32, // How much of the last page is leftover
 
-    pub fn Encode(self: Self) ![]const u8 {
-        var buffer: [max_encoded_size]u8 = undefined;
-        return try Engine.Encode(self, &buffer);
+    pub fn Encode(self: Self) !henc.Encoded(max_encoded_size) {
+        var result: henc.Encoded(max_encoded_size) = undefined;
+
+        const encoded = try Engine.Encode(self, &result.buffer);
+        result.len = encoded.len;
+
+        return result;
     }
 
-    pub fn Decode(slice: []const u8) !henc.DecodeResult(Self) {
+    pub fn Decode(slice: []const u8) !henc.Decoded(Self) {
         return try Engine.Decode(slice);
     }
 };
@@ -137,12 +149,16 @@ pub const Transaction = struct {
     state: TransactionState,
     record: SequenceRecord,
 
-    pub fn Encode(self: Self) ![]const u8 {
-        var buffer: [max_encoded_size]u8 = undefined;
-        return try Engine.Encode(self, &buffer);
+    pub fn Encode(self: Self) !henc.Encoded(max_encoded_size) {
+        var result: henc.Encoded(max_encoded_size) = undefined;
+
+        const encoded = try Engine.Encode(self, &result.buffer);
+        result.len = encoded.len;
+
+        return result;
     }
 
-    pub fn Decode(slice: []const u8) !henc.DecodeResult(Self) {
+    pub fn Decode(slice: []const u8) !henc.Decoded(Self) {
         return try Engine.Decode(slice);
     }
 };
@@ -156,12 +172,16 @@ pub const Index = struct {
     offset: u64,
     length: u32,
 
-    pub fn Encode(self: Self) ![]const u8 {
-        var buffer: [max_encoded_size]u8 = undefined;
-        return try Engine.Encode(self, &buffer);
+    pub fn Encode(self: Self) !henc.Encoded(max_encoded_size) {
+        var result: henc.Encoded(max_encoded_size) = undefined;
+
+        const encoded = try Engine.Encode(self, &result.buffer);
+        result.len = encoded.len;
+
+        return result;
     }
 
-    pub fn Decode(slice: []const u8) !henc.DecodeResult(Self) {
+    pub fn Decode(slice: []const u8) !henc.Decoded(Self) {
         return try Engine.Decode(slice);
     }
 };

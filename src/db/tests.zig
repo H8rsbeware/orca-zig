@@ -49,7 +49,7 @@ test "header_encoder_encodes_and_decodes_simple" {
         .tiny = 1,
     };
 
-    var memory_pool: [@bitSizeOf(SimpleStruct) / 8]u8 = undefined;
+    var memory_pool: [Encoder.max_encoded_size]u8 = undefined;
     // truncated view of the memory pool
     const encoded_slice = try Encoder.Encode(my_s, &memory_pool);
 

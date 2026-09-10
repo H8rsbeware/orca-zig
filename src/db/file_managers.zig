@@ -2,6 +2,7 @@ const std = @import("std");
 const headers = @import("headers.zig");
 
 const MaxFileHeaderSize = headers.FileHeader.max_encoded_size;
+const DefaultPageShift = 12;
 
 pub const TransactionIndex = struct {
     id: headers.SequenceId,
@@ -14,12 +15,30 @@ pub const TransactionFile = struct {
 
     file: std.Io.File,
     header: headers.FileHeader,
-    abs_path: []const u8,
 
     transactions: std.AutoHashMap(TransactionIndex, headers.Transaction),
     allocator: std.mem.Allocator,
 
-    pub fn init(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, path: []const u8) !Self {
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, file_name: []const u8) !Self {
+        var file = dir.openFile(io, file_name, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                var f = try dir.createFile(io, file_name, .{});
+
+                const file_header: headers.FileHeader = .{
+                    .page_shift = DefaultPageShift,
+                    .generation = 0,
+                    .kind = .TRANSACTIONS_STATE,
+                    .version = 1,
+                };
+
+                const encoded = try file_header.Encode();
+                try f.writePositionalAll(io, encoded.slice(), 0);
+                return f;
+            },
+            else => return err,
+        };
+        errdefer file.close(io);
+
         // read the current file header and data into a map of transactions
         const file_length = try file.length(io);
         const max_buffer_size = @max(
@@ -27,7 +46,7 @@ pub const TransactionFile = struct {
             headers.Transaction.max_encoded_size,
         );
 
-        var file_buff: [max_buffer_size]u8 = .undefined;
+        var file_buff: [max_buffer_size]u8 = undefined;
         const init_read_len = try file.readPositional(io, &.{file_buff[0..]}, 0);
 
         const header_info = try headers.FileHeader.Decode(&file_buff[0..init_read_len]);
@@ -50,60 +69,67 @@ pub const TransactionFile = struct {
         }
 
         // use the map to recreate the transaction file and map
-        map = try CleanTransactions(io, allocator, path, header_info.value, map);
+        map = try CleanTransactions(io, allocator, dir, file_name, header_info.value, map);
         file.close(io);
-        const dir = try std.Io.Dir.openDirAbsolute(io, path, .{});
-        defer dir.close(io);
 
         // reopen the file connection
-        file = try dir.openFile(io, path, .{
+        file = try dir.openFile(io, file_name, .{
             .mode = .read_write,
         });
 
         return .{
             .header = header_info.value,
             .file = file,
-            .transaction = map,
+            .transactions = map,
             .allocator = allocator,
         };
     }
 
-    pub fn UpdateTransaction(self: *Self, io: std.Io, index: *TransactionIndex, new_state: headers.TransactionState) !TransactionIndex {
-        index.transaction.*.state = new_state;
+    pub fn deinit(self: *Self, io: std.Io) void {
+        self.close(io);
+        self.transactions.deinit();
+    }
 
-        const new_buffer = try index.transaction.Encode();
+    pub fn UpdateTransaction(self: *Self, io: std.Io, index: TransactionIndex, new_state: headers.TransactionState) !TransactionIndex {
+        var transaction = self.transactions.get(index) orelse return error.TransactionDoesNotExist;
 
-        if (new_buffer.len != index.len) {
+        transaction.state = new_state;
+
+        const new_buffer = try transaction.Encode();
+
+        if (new_buffer.len != index.length) {
             return error.TransactionSizeChanged;
         }
 
-        _ = try self.file.writePositional(io, &.{new_buffer[0..]}, index.start);
+        _ = try self.writePositional(io, &.{new_buffer.slice()}, index.start);
 
+        try self.transactions.put(index, transaction);
         return index;
     }
 
     pub fn WriteTransaction(self: *Self, io: std.Io, transaction: *const headers.Transaction) !TransactionIndex {
-        const current_length = try self.file.length(io);
+        if (self.transactions.get(transaction.*) != null) {
+            return error.TransactionAlreadyExists;
+        }
+
+        const current_length = try self.length(io);
 
         const buffer = try transaction.Encode();
+        const write_size = try self.writePositional(io, &.{buffer.slice()}, current_length);
 
-        const write_size = try self.file.writePositional(io, &.{buffer[0..]}, current_length);
-
-        return .{
-            .len = write_size,
+        const index: TransactionIndex = .{
+            .length = write_size,
             .start = current_length,
-            .transaction = transaction,
+            .id = transaction.record.id,
         };
+
+        try self.transactions.put(index, transaction);
+        return index;
     }
 
-    fn CleanTransactions(io: std.Io, allocator: std.mem.Allocator, path: []const u8, header: *const headers.FileHeader, transactions: *const std.AutoHashMap(TransactionIndex, headers.Transaction)) !std.AutoHashMap(TransactionIndex, headers.Transaction) {
+    fn CleanTransactions(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, file_name: []const u8, header: *const headers.FileHeader, transactions: *const std.AutoHashMap(TransactionIndex, headers.Transaction)) !std.AutoHashMap(TransactionIndex, headers.Transaction) {
         var iter = transactions.iterator();
-
-        const parent_path = std.Io.Dir.path.dirname(path) orelse return error.InvalidPath;
-        const file_name = std.Io.Dir.path.basename(path);
-
-        var dir = try std.Io.Dir.openDirAbsolute(io, parent_path, .{});
-        defer dir.close(io);
+        defer transactions.deinit();
 
         var atomic = try dir.createFileAtomic(io, file_name, .{
             .replace = true,
@@ -111,7 +137,7 @@ pub const TransactionFile = struct {
         defer atomic.deinit(io);
 
         const header_as_bytes = try header.Encode();
-        const init_write_size = try atomic.writePositional(io, &.{header_as_bytes[0..]}, 0);
+        const init_write_size = try atomic.writePositional(io, &.{header_as_bytes.slice()}, 0);
 
         var current_cursor = init_write_size;
 
@@ -121,10 +147,17 @@ pub const TransactionFile = struct {
             if (trans.value_ptr.state == .DONE) {
                 continue;
             }
-            const encoded = try trans.value_ptr.Encode();
-            const write_size = try atomic.writePositional(io, encoded, current_cursor);
 
-            try new_map.put(trans.key_ptr.*, trans.value_ptr.*);
+            const encoded = try trans.value_ptr.Encode();
+            const write_size = try atomic.writePositional(io, encoded.slice(), current_cursor);
+
+            const new_key: TransactionIndex = .{
+                .id = trans.key_ptr.id,
+                .length = encoded.len,
+                .start = current_cursor,
+            };
+
+            try new_map.put(new_key, trans.value_ptr.*);
             current_cursor += write_size;
         }
 
@@ -140,7 +173,30 @@ pub const MetaFile = struct {
     header: headers.FileHeader,
     header_offset: usize,
 
-    pub fn init(io: std.Io, file: std.Io.File) !Self {
+    reserved: std.AutoHashMap(IndexEntry, void),
+    allocator: std.mem.Allocator,
+    current_next: usize,
+
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, file_name: []const u8) !Self {
+        const file = dir.openFile(io, file_name, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                var f = try dir.createFile(io, file_name, .{});
+
+                const file_header: headers.FileHeader = .{
+                    .page_shift = DefaultPageShift,
+                    .generation = 0,
+                    .kind = .META_DATA,
+                    .version = 1,
+                };
+
+                const encoded = try file_header.Encode();
+                try f.writePositionalAll(io, encoded.slice(), 0);
+                return f;
+            },
+            else => return err,
+        };
+        errdefer file.close(io);
+
         var file_buff: [MaxFileHeaderSize]u8 = undefined;
         const init_read_size = try file.readPositional(io, &.{file_buff[0..]}, 0);
 
@@ -150,23 +206,87 @@ pub const MetaFile = struct {
             return error.FileHeaderKindMismatch;
         }
 
+        const file_length = try file.length(io);
         return .{
             .file = file,
             .header = header_info.value,
             .header_offset = header_info.cursor,
+            .reserved = std.AutoHashMap(IndexEntry, void).init(allocator),
+            .allocator = allocator,
+            .current_next = file_length,
         };
     }
 
-    pub fn GetRecordById(self: *Self, io: std.Io, index: *const IndexFile, id: headers.SequenceId) !headers.SequenceRecord {
-        const max_sequence_length = headers.SequenceRecord.max_encoded_size;
-        const idx = try index.GetRecordIndex(id);
+    pub fn deinit(self: *Self, io: std.Io) void {
+        self.close(io);
+        self.reserved.deinit();
+    }
 
-        if (idx.offset < self.header_offset or idx.length > max_sequence_length) {
-            unreachable;
+    pub fn Reserve(self: *Self, record_length: usize) !IndexEntry {
+        const start = self.current_next;
+
+        const reservation: IndexEntry = .{ .length = record_length, .offset = start };
+
+        if (self.reserved.get(reservation) != null) {
+            return error.SpaceAlreadyReserved;
+        }
+
+        try self.reserved.put(reservation, void);
+        self.current_next += record_length;
+        return reservation;
+    }
+
+    pub fn WriteToReservation(self: *Self, io: std.Io, reservation: IndexEntry, enc_data: []const u8) !usize {
+        if (self.reserved.get(reservation) == null) {
+            return error.ReservationNotFound;
+        }
+
+        if (enc_data.len != reservation.length) {
+            return error.ReservationTooSmall;
+        }
+
+        const write_size = try self.writePositional(io, &.{enc_data[0..]}, reservation.offset);
+        _ = self.reserved.remove(reservation);
+
+        return write_size;
+    }
+
+    pub fn UpdateMetaWithReservation(self: *Self, io: std.Io, reservation: IndexEntry, record: *const headers.SequenceRecord) !usize {
+        // WARNING: cant check reservation, going to assume for now
+
+        if (self.current_next < reservation.offset + reservation.length) {
+            return error.ReservationOutOfBounds;
+        }
+
+        const max_sequence_length = headers.SequenceRecord.max_encoded_size;
+
+        var read_buffer: [max_sequence_length]u8 = undefined;
+        const read_size = try self.readPositional(io, &.{read_buffer[0..]}, reservation.offset);
+
+        const meta_info = try headers.SequenceRecord.Decode(&read_buffer[0..read_size]);
+
+        if (record.id != meta_info.value.id) {
+            return error.CannotOverwriteDifferentMeta;
+        }
+
+        const encode = try record.Encode();
+        if (encode.len != meta_info.cursor or encode.len != reservation.length) {
+            return error.UpdateIsLargerThanInitialMeta;
+        }
+
+        const write_size = try self.writePositional(io, &.{encode.slice()}, reservation.offset);
+        return write_size;
+    }
+
+    pub fn GetRecordById(self: *const Self, io: std.Io, index: headers.Index) !headers.SequenceRecord {
+        const max_sequence_length = headers.SequenceRecord.max_encoded_size;
+
+        if (index.offset < self.header_offset or index.length > max_sequence_length) {
+            return error.CorruptionError;
         }
 
         var read_buffer: [max_sequence_length]u8 = undefined;
-        const read_size = try self.file.readPositional(io, &.{read_buffer[0..]}, 0);
+        const read_size = try self.readPositional(io, &.{read_buffer[0..]}, index.offset);
 
         const meta_info = try headers.SequenceRecord.Decode(&read_buffer[0..read_size]);
         return meta_info.value;
@@ -174,7 +294,7 @@ pub const MetaFile = struct {
 };
 
 const IndexEntry = struct {
-    offset: u32,
+    offset: u64,
     length: u32,
 };
 
@@ -187,9 +307,28 @@ pub const IndexFile = struct {
     state: std.AutoHashMap(headers.SequenceId, IndexEntry),
     allocator: std.mem.Allocator,
 
-    next_sequence_id: u64,
+    next_sequence_id: headers.SequenceId,
 
-    pub fn init(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File) !Self {
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, file_name: []const u8) !Self {
+        const file = dir.openFile(io, file_name, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                var f = try dir.createFile(io, file_name, .{});
+
+                const file_header: headers.FileHeader = .{
+                    .page_shift = DefaultPageShift,
+                    .generation = 0,
+                    .kind = .META_DATA,
+                    .version = 1,
+                };
+
+                const encoded = try file_header.Encode();
+                try f.writePositionalAll(io, encoded.slice(), 0);
+                return f;
+            },
+            else => return err,
+        };
+        errdefer file.close(io);
+
         const file_length = try file.length(io);
         const max_read_size: usize = @max(
             MaxFileHeaderSize,
@@ -210,13 +349,13 @@ pub const IndexFile = struct {
         var map = std.AutoHashMap(headers.SequenceId, IndexEntry).init(allocator);
         errdefer map.deinit();
 
-        var max_id: u64 = 0;
+        var max_id: headers.SequenceId = 0;
 
         while (current_cursor < file_length) {
             const read_size = try file.readPositional(io, &.{file_buff}, current_cursor);
 
             const index_info = try headers.Index.Decode(&file_buff[0..read_size]);
-            try map.put(index_info.value.id, .{ .length = index_info.value.offset, .offset = index_info.value.offset });
+            try map.put(index_info.value.id, .{ .length = index_info.cursor, .offset = index_info.value.offset });
 
             max_id = @max(max_id, index_info.value.id);
             current_cursor += index_info.cursor;
@@ -231,7 +370,8 @@ pub const IndexFile = struct {
         };
     }
 
-    pub fn deinit(self: *Self) void {
+    pub fn deinit(self: *Self, io: std.Io) void {
+        self.close(io);
         self.state.deinit();
     }
 
@@ -245,31 +385,29 @@ pub const IndexFile = struct {
         return .{ .id = id, .offset = entry.?.offset, .length = entry.?.length };
     }
 
-    pub fn WriteRecordIndex(self: *Self, index: *const headers.Index) !void {
+    pub fn WriteRecordIndex(self: *Self, io: std.Io, index: *const headers.Index) !void {
         if (self.state.get(index.id) != null) {
             return error.SequenceAlreadyExists;
         }
 
+        const encode = try index.Encode();
+
+        const file_length = self.length(io);
+        try self.writePositional(io, &.{encode.slice()}, file_length);
+
         try self.state.put(index.id, .{ .length = index.length, .offset = index.offset });
     }
 
-    pub fn GetNextId(self: *const Self) u64 {
+    pub fn GetNextId(self: *const Self) headers.SequenceId {
         return self.next_sequence_id;
     }
-};
 
-// Lifecycle
-//  Transaction created
-//  Space reserved in Meta, for Index
-//  Index created for reference
-//  Transaction Updated
-//  Space reserved in Sequence, for Meta
-//  Meta created for record
-//  Transaction Updated
-//  Sequence created with data
-//  Transaction Updated
-//
-//  Transaction Cleared down.
+    pub fn TakeNextId(self: *Self) headers.SequenceId {
+        const taking = self.next_sequence_id;
+        self.next_sequence_id += 1;
+        return taking;
+    }
+};
 
 const PageReservation = struct {
     start: usize,
@@ -288,7 +426,26 @@ pub const SequenceFile = struct {
     allocator: std.mem.Allocator,
     current_next_page: usize,
 
-    pub fn init(io: std.io, allocator: std.mem.Allocator, file: std.Io.File) !Self {
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, file_name: []const u8) !Self {
+        const file = dir.openFile(io, file_name, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                var f = try dir.createFile(io, file_name, .{});
+
+                const file_header: headers.FileHeader = .{
+                    .page_shift = DefaultPageShift,
+                    .generation = 0,
+                    .kind = .META_DATA,
+                    .version = 1,
+                };
+
+                const encoded = try file_header.Encode();
+                try f.writePositionalAll(io, encoded.slice(), 0);
+                return f;
+            },
+            else => return err,
+        };
+        errdefer file.close(io);
+
         var file_buff: [MaxFileHeaderSize]u8 = undefined;
         const init_read_size = try file.readPositional(io, &.{file_buff[0..]}, 0);
 
@@ -297,7 +454,7 @@ pub const SequenceFile = struct {
             return error.FileHeaderKindMismatch;
         }
 
-        const page_length = 1 << header_info.value.page_shift;
+        const page_length: usize = 1 << header_info.value.page_shift;
         const header_len_as_pages = try std.math.divCeil(usize, header_info.cursor, page_length);
 
         const file_length = try file.length(io);
@@ -314,11 +471,12 @@ pub const SequenceFile = struct {
         };
     }
 
-    pub fn deinit(self: *Self) void {
+    pub fn deinit(self: *Self, io: std.Io) void {
+        self.close(io);
         self.reserved.deinit();
     }
 
-    pub fn NextPage(self: *const Self) u64 {
+    pub fn NextPage(self: *const Self) usize {
         return self.current_next_page;
     }
 
@@ -335,11 +493,12 @@ pub const SequenceFile = struct {
             return error.PageReservedAlready;
         }
 
+        try self.reserved.put(pr, void);
         self.current_next_page += as_pages;
         return pr;
     }
 
-    pub fn WriteSequence(self: *Self, io: std.Io, data: []const u8, reservation: *const PageReservation) !usize {
+    pub fn WriteSequence(self: *Self, io: std.Io, data: []const u8, reservation: PageReservation) !usize {
         if (self.reserved.get(reservation) == null) {
             return error.PageReservationNotFound;
         }
@@ -351,7 +510,8 @@ pub const SequenceFile = struct {
             return error.PageReservationTooSmall;
         }
 
-        const write_len = try self.file.writePositional(io, &.{data[0..]}, bit_from);
+        const write_len = try self.writePositional(io, &.{data[0..]}, bit_from);
+        _ = self.reserved.remove(reservation);
         return write_len;
     }
 
@@ -359,28 +519,34 @@ pub const SequenceFile = struct {
         return try self.ReadSequence(
             io,
             .{
-                .file_page = reservation.start,
+                .first_page = reservation.start,
                 .page_length = reservation.length,
                 .page_unused = offset,
             },
         );
     }
 
-    pub fn ReadSequence(self: *const Self, io: std.Io, extent: *const headers.Extent) ![]const u8 {
+    pub fn ReadSequence(self: *const Self, io: std.Io, extent: headers.Extent) ![]const u8 {
         if (extent.first_page + extent.page_length > self.current_next_page) {
             return error.PageOutOfBounds;
         }
 
-        const buffer_size = self.page_length * extent.page_length;
+        const buffer_size = self.page_length * (extent.page_length + self.page_offset);
         const buffer: [buffer_size]u8 = undefined;
 
         const start = self.page_length * extent.first_page;
-        const read_len = try self.file.readPositional(io, &.{buffer[0..]}, start);
+        const read_len = try self.readPositional(io, &.{buffer[0..]}, start);
 
         if (read_len < buffer_size - extent.page_unused) {
             return error.SequenceIncomplete;
         }
 
-        return buffer[0..extent.page_unused];
+        const actual_length = buffer_size - extent.page_unused;
+        return buffer[0..actual_length];
+    }
+
+    pub fn CalcOffset(self: *const Self, data_length: u64, pages: usize) usize {
+        const page_bits = self.page_length * pages;
+        return page_bits - data_length;
     }
 };
