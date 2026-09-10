@@ -84,7 +84,7 @@ pub const Database = struct {
         const reserved_id = self.index_file.TakeNextId();
         const reserved_seq_space = try self.sequence_file.Reserve(io, data_length);
 
-        const calculated_offset = self.sequence_file.CalcOffset(data_length, reserved_seq_space.length);
+        const calculated_offset = self.sequence_file.CalcOffsetFromKnownLengths(data_length, reserved_seq_space.length);
         var record: headers.SequenceRecord = .{
             .id = reserved_id,
             .payload = .{

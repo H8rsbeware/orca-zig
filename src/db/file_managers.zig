@@ -343,7 +343,7 @@ pub const SequenceFile = struct {
     file: std.Io.File,
     header: headers.FileHeader,
     page_offset: usize,
-    page_length: usize,
+    page_size: usize,
 
     reserved: std.AutoHashMap(PageReservation, void),
     allocator: std.mem.Allocator,
@@ -355,17 +355,17 @@ pub const SequenceFile = struct {
 
         const header_info = try decodeAndEnsureHeaderFile(io, file, .SEQUENCE_DATA);
 
-        const page_length: usize = 1 << header_info.value.page_shift;
-        const header_len_as_pages = try std.math.divCeil(usize, header_info.cursor, page_length);
+        const page_size: usize = 1 << header_info.value.page_shift;
+        const header_len_as_pages = try std.math.divCeil(usize, header_info.cursor, page_size);
 
         const file_length = try file.length(io);
-        const file_len_as_pages = try std.math.divCeil(usize, file_length, page_length);
+        const file_len_as_pages = try std.math.divCeil(usize, file_length, page_size);
 
         return .{
             .file = file,
             .header = header_info.value,
             .page_offset = header_len_as_pages,
-            .page_length = page_length,
+            .page_size = page_size,
             .current_next_page = file_len_as_pages - header_len_as_pages,
             .reserved = std.AutoHashMap(PageReservation, void).init(allocator),
             .allocator = allocator,
@@ -382,7 +382,7 @@ pub const SequenceFile = struct {
     }
 
     pub fn Reserve(self: *Self, data_length: usize) !PageReservation {
-        const as_pages = try std.math.divCeil(usize, data_length, self.page_length);
+        const as_pages = try std.math.divCeil(usize, data_length, self.page_size);
         const page_to_provide = self.current_next_page;
 
         const pr: PageReservation = .{
@@ -404,8 +404,8 @@ pub const SequenceFile = struct {
             return error.PageReservationNotFound;
         }
 
-        const bit_from = self.page_length * (self.page_offset + reservation.start);
-        const bit_length = self.page_length * reservation.length;
+        const bit_from = self.pageLengthToBits(self.page_offset + reservation.start);
+        const bit_length = self.pageLengthToBits(reservation.length);
 
         if (bit_length < data.len) {
             return error.PageReservationTooSmall;
@@ -432,10 +432,10 @@ pub const SequenceFile = struct {
             return error.PageOutOfBounds;
         }
 
-        const buffer_size = self.page_length * (extent.page_length + self.page_offset);
+        const buffer_size = self.pageLengthToBits(extent.page_length + self.page_offset);
         const buffer: [buffer_size]u8 = undefined;
 
-        const start = self.page_length * extent.first_page;
+        const start = self.pageLengthToBits(extent.first_page);
         const read_len = try self.readPositional(io, &.{buffer[0..]}, start);
 
         if (read_len < buffer_size - extent.page_unused) {
@@ -446,9 +446,13 @@ pub const SequenceFile = struct {
         return buffer[0..actual_length];
     }
 
-    pub fn CalcOffset(self: *const Self, data_length: u64, pages: usize) usize {
-        const page_bits = self.page_length * pages;
+    pub fn CalcOffsetFromKnownLengths(self: *const Self, data_length: u64, pages: usize) usize {
+        const page_bits = self.page_size * pages;
         return page_bits - data_length;
+    }
+
+    fn pageLengthToBits(self: *const Self, pages: usize) usize {
+        return pages * self.page_size;
     }
 };
 
