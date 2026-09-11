@@ -1,7 +1,7 @@
 const std = @import("std");
 const headers = @import("headers.zig");
 
-const MaxFileHeaderSize = headers.FileHeader.max_encoded_size;
+const MaxFileHeaderSize = headers.FileHeader.FileHeaderSize;
 const DefaultPageShift = 12;
 
 pub const TransactionIndex = struct {

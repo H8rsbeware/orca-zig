@@ -41,27 +41,61 @@ pub const DBFileType = enum(u3) {
 /// File header is written to the top of each db file,
 /// including version, kind (DBFileType), page_shift (where size == 1<<S),
 /// and generation (update count).
-pub const FileHeader = struct { // 83
+pub const FileHeader = struct {
     const Self = @This();
-    const Engine = henc.StructEncoderBuilder(Self);
-    pub const max_encoded_size = Engine.max_encoded_size;
+    pub const FileHeaderSize: usize = 64;
 
+    const magic: u32 = 0b01101111_01110010_01100011_01100001; // orca in bin
     version: u8,
     kind: DBFileType,
     page_shift: u8,
     generation: u64,
 
-    pub fn Encode(self: Self) !henc.Encoded(max_encoded_size) {
-        var result: henc.Encoded(max_encoded_size) = undefined;
+    pub fn Encode(self: *const Self) henc.Encoded(FileHeaderSize) {
+        var buffer: [FileHeaderSize]u8 = @splat(0);
 
-        const encoded = try Engine.Encode(self, &result.buffer);
-        result.len = encoded.len;
+        std.mem.writeInt(u32, &buffer[0..4], magic, .big);
 
-        return result;
+        buffer[4] = self.version;
+        buffer[5] = self.page_shift;
+        buffer[6] = @intFromEnum(self.kind);
+
+        std.mem.writeInt(u64, &buffer[7..15], self.generation, .big);
+
+        return .{
+            .len = FileHeaderSize,
+            .buffer = buffer,
+        };
     }
 
-    pub fn Decode(slice: []const u8) !henc.Decoded(Self) {
-        return try Engine.Decode(slice);
+    pub fn Decode(raw: []const u8) !henc.Decoded(Self) {
+        if (raw.len < FileHeaderSize) {
+            return error.HeaderTooShort;
+        }
+
+        const read_magic = std.mem.readInt(u32, &raw[0..4], .big);
+
+        if (read_magic != magic) {
+            return error.HeaderInvalid;
+        }
+
+        const read_version = raw[4];
+        const read_page_shift = raw[5];
+
+        const read_kind_value = raw[6];
+        const as_enum = try henc.enumFromIntChecked(DBFileType, read_kind_value);
+
+        const read_generation = std.mem.readInt(u64, &raw[7..15], .big);
+
+        return .{
+            .cursor = FileHeaderSize,
+            .value = .{
+                .version = read_version,
+                .page_shift = read_page_shift,
+                .kind = as_enum,
+                .generation = read_generation,
+            },
+        };
     }
 };
 

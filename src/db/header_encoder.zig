@@ -407,7 +407,7 @@ fn maxEncodedSize(comptime meta: []const FieldContext) usize {
     return size;
 }
 
-fn enumFromIntChecked(comptime T: type, value: @typeInfo(T).@"enum".tag_type) !void {
+pub fn enumFromIntChecked(comptime T: type, value: @typeInfo(T).@"enum".tag_type) !T {
     inline for (@typeInfo(T).@"enum".fields) |f| {
         if (value == f.value) return @enumFromInt(value);
     }
